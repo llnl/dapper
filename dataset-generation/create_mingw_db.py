@@ -37,7 +37,7 @@ from typing_extensions import Self
 from dapper_python.databases_v2.database import Metadata
 from dapper_python.databases_v2.mingw_db import MinGWDatabase
 from dapper_python.databases_v2.mingw_db import Package, PackageFile, SourceFile
-from dapper_python.databases_v2.mingw_db import FunctionSymbol, PreprocessDefine, StringLiteral
+from dapper_python.databases_v2.mingw_db import FunctionSymbol
 from dapper_python.dataset_generation.parsing.cpp import CPPTreeParser
 from dapper_python.dataset_generation.utils.archive import SafeTarFile, SafeZipFile
 
@@ -138,7 +138,7 @@ class PackageAnalyzer:
         self._package_dir = None
         return self._exit_stack.__exit__(exc_type, exc_val, exc_tb)
 
-    def analyze_package(self) -> tuple[Package | None, dict[str, Any]]:
+    def analyze_package(self) -> Package | None:
         """Analyzes the package and returns the parsed data"""
         if self._temp_dir is None:
             raise RuntimeError("Must be used within context manager")
@@ -152,7 +152,7 @@ class PackageAnalyzer:
             analyzed_package_sources = self._analyze_package_source()
             mingw_package.source_files = analyzed_package_sources
         except (zstd.ZstdError, tarfile.ReadError):
-            return None, {}
+            return None
 
         with suppress(zstd.ZstdError, tarfile.ReadError):
             analyzed_package_files, symbols = self._analyze_package_contents()
@@ -165,7 +165,7 @@ class PackageAnalyzer:
                         # Such as std::string -> std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char>>
                         function_symbol.in_binary = function_symbol.qualified_symbol_name in symbols
 
-        return mingw_package, self._as_json_dict(mingw_package)
+        return mingw_package
 
     def _analyze_package_source(self) -> list[SourceFile]:
         if self._source_dir is None:
@@ -221,17 +221,6 @@ class PackageAnalyzer:
                 )
                 for x in tree.parse_functions()
             ]
-            # Monkey-patch in pre-process defines and string literals
-            # Which are not included in the database but should be passed up the chain, associated with each SourceFile
-            source_file.preproc_defines = [
-                PreprocessDefine(name=x.name, value=x.value)
-                for x in tree.parse_preproc_defs()
-            ]
-            source_file.string_literals = [
-                StringLiteral(value=x.value)
-                for x in tree.parse_string_literals()
-            ]
-
             source_files.append(source_file)
 
         return source_files
@@ -287,29 +276,6 @@ class PackageAnalyzer:
 
         return package_files, symbols
 
-    # noinspection Pydantic
-    def _as_json_dict(self, package: Package) -> dict[str, Any]:
-        # preproc_defines and string_literals attributes are monkey-patched onto each file
-        # Since they are [currently] not part of the actual database schema
-        return {
-            "package_info": {
-                "name": self._mysys_package.package_name,
-                "version": self._mysys_package.package_version,
-                "description": self._mysys_package.description,
-                "package_url": self._mysys_package.package_url,
-                "source_url": self._mysys_package.source_url,
-                "contents_url": self._mysys_package.contents_url,
-            },
-            "contents": {
-                str(_source_file.file_path): {
-                    "functions": [x.model_dump(exclude={"id", "file_id"}) for x in _source_file.functions],
-                    "preproc_defines": [x.model_dump(exclude={"id", "file_id"}) for x in _source_file.preproc_defines],
-                    "string_literals": [x.model_dump(exclude={"id", "file_id"}) for x in _source_file.string_literals],
-                }
-                for _source_file in package.source_files
-            },
-        }
-
     _NON_FUNCTION_PREFIXES = (
         "sub_",  # Special case since we don't want anonymous functions/code sections angr finds without a name
         "vtable for",
@@ -348,13 +314,8 @@ def disable_logging(highest_level=logging.CRITICAL):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "-d", "--dir",
-        type=Path, default=Path.cwd(),
-        help="Directory to save database + generated files to",
-    )
-    parser.add_argument(
         "-o", "--output",
-        type=str, default="MinGWDB.db",
+        type=Path, default=Path("MinGWDB.db"),
         help="Name of the output database file",
     )
     parser.add_argument(
@@ -363,9 +324,6 @@ def main():
         help="Version of the database",
     )
     args = parser.parse_args()
-
-    if not args.dir.exists() or not args.dir.is_dir():
-        raise FileNotFoundError(f"No such directory: {args.dir}")
 
     params = {"repo": Arch.MINGW_64}
     with suppress_warnings(), requests.get(PACKAGE_INDEX_URL, params=params, verify=False) as response:
@@ -397,8 +355,7 @@ def main():
                 package_url=package_link,
             )
 
-    db_path = args.dir.joinpath(args.output)
-    mingw_db = MinGWDatabase.create_database(db_path, exist_ok=True)
+    mingw_db = MinGWDatabase.create_database(args.output, exist_ok=True)
     with mingw_db.session() as session:
         # Remove any outdated packages
         with session.begin():
@@ -419,13 +376,11 @@ def main():
 
             # noinspection PyTypeChecker, Pydantic
             saved_packages: set[str] = set(session.exec(select(Package.package_name)))
+            to_update = sorted(list(set(package_list.keys()) - saved_packages))
             to_update = [
                 package_list[package_name]
-                for package_name in set(package_list.keys()) - saved_packages
+                for package_name in to_update
             ]
-
-        json_dir: Path = args.dir.joinpath("json_dump")
-        json_dir.mkdir(exist_ok=True)
 
         # Get new packages and add to the database
         progress_iter = tqdm(
@@ -437,15 +392,16 @@ def main():
         )
         for package in progress_iter:
             with PackageAnalyzer(package) as analyzer:
-                mingw_package, json_dump = analyzer.analyze_package()
+                mingw_package = analyzer.analyze_package()
                 if not mingw_package:
                     continue
 
-            dump_path = json_dir.joinpath(f"{mingw_package.package_name}.json")
             with session.begin():
                 session.add(mingw_package)
-                with open(dump_path, "w", encoding="utf-8") as f:
-                    json.dump(json_dump, f, indent="\t")
+
+            # Due to somewhat high memory usage, free up memory before the next loop starts
+            del mingw_package
+            mingw_package = None
 
         # Reset the metadata if it already exists and set new version
         with session.begin():
