@@ -430,6 +430,60 @@ func updateRepositoriesCache(cachedData, newData []map[string]interface{}) []map
 	return cachedData
 }
 
+func updateTagsCache(cachedData, newData []map[string]interface{}) []map[string]interface{} {
+	lookup := make(map[string]map[string]interface{})
+	for _, c := range cachedData {
+		if name, ok := c["name"].(string); ok {
+			lookup[name] = c
+		}
+	}
+	for _, n := range newData {
+		name, ok := n["name"].(string)
+		if !ok {
+			continue
+		}
+		if cached, ok := lookup[name]; ok {
+			if cached["last_updated"] != n["last_updated"] {
+				// Update all fields
+				for k, v := range n {
+					cached[k] = v
+				}
+			}
+		} else {
+			cachedData = append(cachedData, n)
+		}
+	}
+	return cachedData
+}
+
+func checkRepoNeedsUpdate(repo map[string]interface{}, tagsFilePath string) bool {
+	lastUpdatedStr, ok := repo["last_updated"].(string)
+	if !ok {
+		return true // No last_updated info, assume update needed
+	}
+
+	// Parse repo last updated time
+	repoTime, err := time.Parse(time.RFC3339Nano, lastUpdatedStr)
+	if err != nil {
+		// Try without Nano if it fails, although RFC3339Nano covers standard RFC3339
+		repoTime, err = time.Parse(time.RFC3339, lastUpdatedStr)
+		if err != nil {
+			log.Printf("Failed to parse last_updated: %s", lastUpdatedStr)
+			return true
+		}
+	}
+
+	fileInfo, err := os.Stat(tagsFilePath)
+	if os.IsNotExist(err) {
+		return true
+	}
+	if err != nil {
+		return true
+	}
+
+	return repoTime.After(fileInfo.ModTime())
+}
+
 func main() {
 	saveDir := flag.String("saveDir", "", "Directory to save fetched JSON/config/manifest files")
 	getUnsupportedManifests := flag.Bool("getUnsupportedManifests", false, "Read and use the failed fetches file")
@@ -520,7 +574,11 @@ func main() {
 		repo_name := repo["name"].(string)
 
 		tagsOutFile := fmt.Sprintf("%s%s.json", tagsDir, repo_name)
-		tags, err := loadOrFetchData(tagsOutFile, fmt.Sprintf("%s/%s/tags", baseURL, repo_name), nil)
+		var tagsUpdateFunc func([]map[string]interface{}, []map[string]interface{}) []map[string]interface{}
+		if *updateCache && checkRepoNeedsUpdate(repo, tagsOutFile) {
+			tagsUpdateFunc = updateTagsCache
+		}
+		tags, err := loadOrFetchData(tagsOutFile, fmt.Sprintf("%s/%s/tags", baseURL, repo_name), tagsUpdateFunc)
 		for _, tag := range tags {
 			tag_name, tagNameOk := tag["name"].(string)
 			tag_status, tagStatusOk := tag["tag_status"].(string)
@@ -530,7 +588,7 @@ func main() {
 			// TODO there may be some tags we want to fetch where one of arch/os is null, but the other is present... check dataset to see what's up with these ones
 
 			// This is a bit of a hack -- basically, the website returns digests that don't work for getting more data
-			// the unsupported manifests option looks at the list output after trying to fetch all tags for ones that gotß
+			// the unsupported manifests option looks at the list output after trying to fetch all tags for ones that got
 			// a MANIFEST_SCHEMA_UNSUPPORTED error, and then tries to get digests for updated manifests for those tags
 			// and then re-saving the tag data files with the new digets. Future (regular?) updates should recognize
 			// when tag data exists already and only add data for tags that is newer than what is already saved, so
