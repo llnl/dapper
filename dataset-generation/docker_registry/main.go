@@ -865,13 +865,6 @@ func main() {
 		i++
 	}
 
-	// TODO after pulling everything:
-	// - check what tags have an architecture but no os (or vice versa) and see what's up, if they need pulling
-	// - check that all referenced manifests have been pulled, and that all config files referenced in manifests have been pulled
-	// - construct json output file with repo:tag key that lists platforms and diff_ids and compressed layer hashes for each
-	// - construct json output file keyed with digests from uncompressed layers that maps to repo:tag and platform info
-	// - construct json output file with compressed layers that maps to repo:tag and platform info
-	// - create sqlite database with the information from the above tables, indexed for fast look ups by repo/tag and digest
-	// - see how many digests are shared between different tags/repos (e.g. one image uses another as a base layer?)
-	// - figure out query procedure for determining the "right" base image repo:tag for a given digest
+	// Data processing and database generation
+	processData(*saveDir)
 }

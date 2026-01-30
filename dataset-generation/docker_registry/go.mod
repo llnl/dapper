@@ -11,6 +11,7 @@ require (
 	github.com/docker/docker-credential-helpers v0.8.2 // indirect
 	github.com/google/go-containerregistry v0.20.3 // indirect
 	github.com/klauspost/compress v1.17.11 // indirect
+	github.com/mattn/go-sqlite3 v1.14.33 // indirect
 	github.com/mitchellh/go-homedir v1.1.0 // indirect
 	github.com/opencontainers/go-digest v1.0.0 // indirect
 	github.com/opencontainers/image-spec v1.1.0 // indirect
