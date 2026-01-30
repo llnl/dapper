@@ -42,6 +42,7 @@ def main(save_json_dir=None):
     base_url = "https://hub.docker.com/v2/repositories/library/"
     repositories = fetch_all_pages(f"{base_url}?page_size=100")
 
+    # TODO: since we scraped all this information already, add a mode that avoids query and uses downloaded data to regenerate mapping json (should de-duplicate SHA hash keys, and list out os/arch platform tag for the image when regenerating it to reduce number of authenticated queries required to get config files)
     if save_json_dir:
         os.makedirs(save_json_dir, exist_ok=True)
         save_json(repositories, os.path.join(save_json_dir, "repositories.json"))
@@ -49,6 +50,8 @@ def main(save_json_dir=None):
     image_mapping = {}
 
     for repo in repositories:
+        if 'name' not in repo:
+            logging.warning(f"No name in repo: {repo}")
         repo_name = repo['name']
         logging.info(f"Fetching tags for repository: {repo_name}")
         tags = fetch_all_pages(f"{base_url}{repo_name}/tags?page_size=100")
@@ -57,10 +60,17 @@ def main(save_json_dir=None):
             save_json(tags, os.path.join(save_json_dir, f"{repo_name}.json"))
 
         for tag in tags:
+            if 'name' not in tag:
+                logging.warning(f"No tag name for tag in {repo_name}: {tag}")
             tag_name = tag['name']
+            if 'images' not in tag:
+                logging.warning(f"No images for {repo_name}:{tag_name}: {tag}")
             for image in tag['images']:
-                digest = image['digest']
-                image_mapping[digest] = f"{repo_name}:{tag_name}"
+                if 'digest' in image:
+                    digest = image['digest']
+                    image_mapping[digest] = f"{repo_name}:{tag_name}"
+                else:
+                    logging.warning(f"No digest in image for {repo_name}:{tag_name}: {image}")
 
     if save_json_dir:
         save_json(image_mapping, os.path.join(save_json_dir, "image_mapping.json"))
