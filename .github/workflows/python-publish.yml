@@ -50,7 +50,7 @@ jobs:
       working-directory: python
 
     - name: Upload Python package dist artifacts
-      uses: actions/upload-artifact@v6
+      uses: actions/upload-artifact@v7
       with:
         name: python-package-dist
         path: python/dist
