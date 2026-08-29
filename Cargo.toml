@@ -32,7 +32,7 @@ toml = "0.9.8"
 serde = { version =  "1.0.228", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
 reqwest = { version = "0.12", features = ["blocking"] }
-zip = "6.0"
+zip = "7.0"
 
 [dev-dependencies]
 tempfile = "3.23"
