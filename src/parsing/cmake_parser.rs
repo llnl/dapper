@@ -112,7 +112,7 @@ impl CMakeParser {
                 arg_dict.insert(pair[0].clone(), pair[1].clone());
             }
             if let Some(dangling) = groups.chunks_exact(2).remainder().first() {
-                eprintln!("Warning: Dangling key without value: {}", dangling);
+                eprintln!("Warning: Dangling key without value: {dangling}");
             }
 
             if arg_dict.contains_key("URL") {

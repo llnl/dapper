@@ -10,12 +10,14 @@ use std::{fs, mem};
 use streaming_iterator::StreamingIterator;
 
 use rusqlite::params;
-use tree_sitter::{Parser, Query, QueryCursor};
+use tree_sitter::{Parser, Query, QueryCapture, QueryCursor};
 
 use super::parser::{par_file_iter, LibProcessor};
 use super::parser::{LangInclude, LibParser, SourceFinder};
 
 use crate::dataset::database::Database;
+use crate::parsing::bash_parser;
+use crate::parsing::parser::SystemProgram;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PythonImport {
@@ -358,6 +360,31 @@ lazy_static::lazy_static! {
     ].into_iter().collect();
 }
 
+lazy_static::lazy_static! {
+    static ref PYTHON_SYS_CALL_QUERY: Query = Query::new(
+        &tree_sitter_python::LANGUAGE.into(),
+        r#"
+        ; 1) free‐standing calls:   foo(arg1, arg2)
+        (call
+          function: (identifier)              @function_name
+          arguments: (argument_list (expression)   @arg_list
+            )
+        )
+
+        ; 2) single‐module calls:    os.system("…")
+        (call
+          function: (attribute
+          object: (identifier) @module
+          attribute: (identifier) @function_name
+            )
+          arguments: (argument_list
+            (expression)                        @arg_list
+            )
+        )
+        "#
+    ).expect("Error creating query");
+}
+
 impl<'db> PythonParser<'db> {
     pub fn new(package_database: &'db Database, os_database: &'db Database) -> Self {
         PythonParser {
@@ -450,19 +477,131 @@ impl<'db> PythonParser<'db> {
         imports
     }
 
-    fn process_files<T>(&self, file_paths: T) -> HashMap<PythonImport, Vec<Vec<String>>>
+    fn is_likely_syscall(module: &str, func: &str) -> bool {
+        let combined = format!("{module}.{func}");
+        let predefined = ["os.system", "subprocess.run"];
+
+        predefined.contains(&combined.as_str())
+    }
+
+    pub fn extract_sys_calls(file_path: &Path) -> HashSet<LangInclude> {
+        let mut calls = HashSet::new(); // variable to hold the final grouping of calls
+        let source_code = match fs::read_to_string(file_path) // read the file into a string
+        {
+            Ok(content) => content,
+            Err(e) =>
+            {
+                eprintln!("Error reading {}: {}", file_path.to_str().unwrap(), e);
+                return calls;
+            }
+        };
+
+        // parse with tree-sitter
+        let mut parser = Parser::new(); // create a new parser
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into()) // set the parser language
+            .expect("Error loading Python grammar");
+        let tree = parser.parse(&source_code, None).unwrap(); // create a tree
+        let root = tree.root_node(); // set the root node
+
+        let mut query_cursor = QueryCursor::new(); // object to query the tree
+        let mut matches =
+            query_cursor.matches(&PYTHON_SYS_CALL_QUERY, root, source_code.as_bytes()); // look for matches in the src file as bytes
+
+        while let Some(m) = matches.next()
+        // loop to process each match that is found
+        {
+            // capture slots
+            let mut func_name: Option<String> = None; // variable to hold the function name
+            let mut args_node = None; // variable to hold the args
+            let mut module_name = None; // variable to hold the combined module and function name
+
+            for QueryCapture { node, index, .. } in m.captures
+            // for loop to loop over the matches
+            {
+                let capture_name = PYTHON_SYS_CALL_QUERY.capture_names()[*index as usize]; // represents the current capture
+                match capture_name // set the func_name and args_node variables to what was in the capture
+                {
+                    "function_name" => 
+                    {
+                        if let Ok(t) = node.utf8_text(source_code.as_bytes())
+                        {
+                            func_name = Some(t.to_string());
+                        }
+                    }
+                    "arg_list" => 
+                    {
+                        args_node = Some(node);
+                    }
+                    "module" =>
+                    {
+                        if let Ok(t) = node.utf8_text(source_code.as_bytes())
+                        {
+                            module_name = Some(t.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            if let (Some(f), Some(arg_list_node)) = (func_name, args_node)
+            // check if both variables are not None
+            {
+                // println!("func_name = {} ", f);
+                // println!("module_name = {:?} ", module_name);
+
+                if let Some(ref module) = module_name {
+                    if !Self::is_likely_syscall(module, &f) {
+                        continue; // not a system call we're interested in at the moment, so skip analysis
+                    }
+
+                    let mut stack = vec![*arg_list_node];
+                    while let Some(node) = stack.pop() {
+                        if node.kind() == "string" {
+                            if let Ok(raw) = node.utf8_text(source_code.as_bytes()) {
+                                let cleaned =
+                                    raw.trim_matches('"').trim_matches('\'').replace('\n', " ");
+                                if let Some(cmd) = bash_parser::parse_bash_command(&cleaned) {
+                                    calls.insert(LangInclude::OS(SystemProgram::Application(cmd)));
+                                }
+                            }
+                            continue; // we've handled this node; don't also walk its children
+                        }
+
+                        let mut child_cursor = node.walk();
+                        for child in node.children(&mut child_cursor) {
+                            stack.push(child);
+                        }
+                    }
+                }
+            }
+        }
+
+        calls
+    }
+
+    fn process_files<T>(&self, file_paths: T) -> HashMap<LangInclude, Vec<Vec<String>>>
     where
         T: IntoIterator,
         T::Item: AsRef<Path>,
     {
         //Using Rayon for parallel processing associates wrapping set with Mutex for synchronization
         let global_imports: Mutex<HashSet<PythonImport>> = Mutex::new(HashSet::new());
+        let global_sys_calls: Mutex<HashSet<LangInclude>> = Mutex::new(HashSet::new());
 
         par_file_iter(file_paths, |file_path| {
             let file_includes = Self::extract_includes(file_path);
             let mut global_includes = global_imports.lock().unwrap();
             for include in file_includes {
                 global_includes.insert(include);
+            }
+            // syscalls
+            let file_sys_calls = Self::extract_sys_calls(file_path);
+            {
+                let mut g = global_sys_calls.lock().unwrap();
+                for sc in file_sys_calls {
+                    g.insert(sc);
+                }
             }
         });
 
@@ -517,7 +656,35 @@ impl<'db> PythonParser<'db> {
             }
         }
 
-        global_import_map
+        // Map collected syscalls to packages
+        let global_sys_calls = mem::take(&mut *global_sys_calls.lock().unwrap());
+        let mut syscall_map: HashMap<LangInclude, Vec<Vec<String>>> = HashMap::new();
+
+        for call in global_sys_calls.into_iter() {
+            let func_name = match &call {
+                LangInclude::OS(SystemProgram::Application(cmd)) => cmd.to_lowercase(),
+                _ => continue,
+            };
+
+            if let Ok(libs) = query_db(&func_name) {
+                // Uncomment below if you only want to return strings that appear in the database
+                // if !libs.is_empty() {
+                //     syscall_map.insert(call, vec![libs]);
+                // }
+                syscall_map.insert(call, vec![libs]);
+            }
+        }
+
+        // Merge both maps into the required return type
+        let mut result: HashMap<LangInclude, Vec<Vec<String>>> = HashMap::new();
+        for (import, libs) in global_import_map {
+            result.insert(LangInclude::Python(import), libs);
+        }
+        for (call, libs) in syscall_map {
+            result.insert(call, libs);
+        }
+
+        result
     }
 }
 
@@ -533,13 +700,11 @@ impl LibParser for PythonParser<'_> {
             .collect()
     }
 
-    fn extract_sys_calls(_file_path: &Path) -> HashSet<LangInclude>
+    fn extract_sys_calls(file_path: &Path) -> HashSet<LangInclude>
     where
         Self: Sized,
     {
-        //Argument _file_path prefixed with underscore to prevent complaints from cargo
-        //Rename to "file_path" when implementing
-        HashSet::new()
+        Self::extract_sys_calls(file_path)
     }
 }
 
@@ -549,10 +714,9 @@ impl LibProcessor for PythonParser<'_> {
         T: IntoIterator,
         T::Item: AsRef<Path>,
     {
-        // fn process_files(&self, file_path: Vec<&str>) -> Vec<(LangInclude, Vec<String>)>{
         self.process_files(file_paths)
             .into_iter()
-            .map(|(python_include, vec)| (LangInclude::Python(python_include), vec))
+            //.map(|(python_include, vec)| (python_include, vec))
             .collect()
     }
 }
@@ -637,5 +801,36 @@ mod tests {
         .into_iter()
         .collect();
         assert_eq!(from_alias_imports, exp_from_alias_imports);
+    }
+
+    #[test]
+    fn test_extract_python_syscalls() {
+        let test_file = Path::new("tests/test_files/test_sys_calls.py");
+        // Run the extractor
+        let calls = PythonParser::extract_sys_calls(test_file);
+
+        // Collect only OS application names from the result set
+        let mut found: HashSet<String> = HashSet::new();
+        for call in calls {
+            if let LangInclude::OS(SystemProgram::Application(name)) = call {
+                found.insert(name);
+            }
+        }
+
+        // Positive cases
+        assert!(
+            found.contains("ls"),
+            "Expected to find 'ls' from os.system(\"ls -l /tmp\")"
+        );
+        assert!(
+            found.contains("echo"),
+            "Expected to find 'echo' from subprocess.run(\"echo hello\", shell=True)"
+        );
+
+        // Negative case: free-standing run(...) is not in the allowed (module.func) list
+        assert!(
+            !found.contains("rm"),
+            "Did not expect to match free-standing run(\"rm ...\")"
+        );
     }
 }
