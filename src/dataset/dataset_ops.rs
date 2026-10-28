@@ -146,31 +146,18 @@ pub fn install_dataset(dataset_name: &str, prompt: bool) -> Result<(), Box<dyn E
         .first()
         .ok_or("No download URL found in dataset")?;
 
-    // Download the dataset
-    println!("Downloading from: {url}");
-    let download_response =
-        reqwest::blocking::get(url).map_err(|e| format!("Failed to download dataset: {e}"))?;
-
-    if !download_response.status().is_success() {
-        return Err(format!(
-            "Failed to download dataset: HTTP {}",
-            download_response.status()
-        )
-        .into());
-    }
-
-    // Saves it to tmp file
     let temp_zip_path = base_dir.join(format!("{dataset_name}.zip.tmp"));
     let mut temp_file = File::create(&temp_zip_path)
         .map_err(|e| format!("Failed to create temporary file: {e}"))?;
 
-    let content = download_response
-        .bytes()
-        .map_err(|e| format!("Failed to read download content: {e}"))?;
-
-    std::io::copy(&mut content.as_ref(), &mut temp_file)
-        .map_err(|e| format!("Failed to write temporary file: {e}"))?;
-
+    // On any download failure, remove the partially written file
+    // TODO: if failure happens after this (at extraction for example), the temp file delete is never reached
+    // Should add the same pull out logic -> delete if unsuccessful
+    if let Err(e) = download_to_file(url, &mut temp_file) {
+        drop(temp_file);
+        fs::remove_file(&temp_zip_path).ok();
+        return Err(e);
+    }
     drop(temp_file);
 
     // Extract the zip file
@@ -218,6 +205,26 @@ pub fn install_dataset(dataset_name: &str, prompt: bool) -> Result<(), Box<dyn E
     update_dataset_info(Some(base_dir.clone()), dataset_name, new_dataset, true)?;
 
     println!("Successfully installed dataset: {dataset_name}");
+    Ok(())
+}
+
+fn download_to_file(url: &str, file: &mut File) -> Result<(), Box<dyn Error>> {
+    // Download the dataset
+    println!("Downloading from: {url}");
+    let mut download_response =
+        reqwest::blocking::get(url).map_err(|e| format!("Failed to download dataset: {e}"))?;
+
+    if !download_response.status().is_success() {
+        return Err(format!(
+            "Failed to download dataset: HTTP {}",
+            download_response.status()
+        )
+        .into());
+    }
+
+    // Stream contents directly to disk
+    download_response.copy_to(file)?;
+
     Ok(())
 }
 
@@ -592,5 +599,61 @@ impl DatasetDisplay for RemoteCatalog {
         }
 
         println!("{}", "=".repeat(80));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // TODO: test cleanup and stalls
+    use super::*;
+    use std::io::Read;
+    use std::net::{TcpListener, TcpStream};
+    use std::thread;
+    use std::time::Duration;
+
+    /// Starts a fake server that answers one request with `respond` and returns its URL
+    fn serve(respond: impl FnOnce(TcpStream) + Send + 'static) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = stream.read(&mut [0; 1024]);
+            respond(stream);
+        });
+        url
+    }
+
+    #[test]
+    fn test_download_to_file() {
+        let url = serve(|mut stream| {
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+                .unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dataset.zip");
+        download_to_file(&url, &mut File::create(&path).unwrap()).unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn test_download_to_file_slow_download() {
+        let url = serve(|mut stream| {
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 35\r\n\r\n")
+                .unwrap();
+            for _ in 0..35 {
+                stream.write_all(b"x").unwrap();
+                thread::sleep(Duration::from_secs(1));
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dataset.zip");
+        download_to_file(&url, &mut File::create(&path).unwrap()).unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), [b'x'; 35]);
     }
 }
