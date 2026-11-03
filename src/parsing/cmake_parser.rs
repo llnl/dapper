@@ -108,10 +108,11 @@ impl CMakeParser {
             let mut arg_dict = HashMap::new();
             let groups = args.iter().skip(1).cloned().collect::<Vec<_>>();
 
-            for pair in groups.chunks_exact(2) {
+            let (pairs, remainder) = groups.as_chunks::<2>();
+            for pair in pairs {
                 arg_dict.insert(pair[0].clone(), pair[1].clone());
             }
-            if let Some(dangling) = groups.chunks_exact(2).remainder().first() {
+            if let Some(dangling) = remainder.first() {
                 eprintln!("Warning: Dangling key without value: {}", dangling);
             }
 
