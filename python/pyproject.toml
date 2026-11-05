@@ -4,17 +4,22 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dapper-python"
-version = "0.0.0.dev3"
+version = "0.0.0.dev4"
 description = "A Python package for interacting with DAPper datasets"
 authors = [
     { name = "Ryan Mast", email = "mast9@llnl.gov" }
 ]
 license = "MIT"
 readme = "README.md"
-requires-python = ">=3.6"
+requires-python = ">=3.9"
 dependencies = [
     "tomlkit",
-    "typing-extensions>=4.6; python_version < '3.10'"
+    "more-itertools",
+    "typing-extensions",
+    #Database
+    "sqlmodel",
+    "pydantic",
+    "sqlalchemy",
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -33,12 +38,14 @@ Discussions = "https://github.com/LLNL/dapper/discussions"
 "Source Code" = "https://github.com/LLNL/dapper"
 
 [project.optional-dependencies]
-test = ["pytest"]
+test = ["pytest", "tree-sitter", "tree-sitter-cpp"]
 dev = ["build", "pre-commit"]
+dataset-generation = ["requests", "tqdm", "tree-sitter", "tree-sitter-cpp"]
 
 [dependency-groups]
-test = ["pytest"]
+test = ["pytest", "tree-sitter", "tree-sitter-cpp"]
 dev = ["build", "pre-commit"]
+dataset-generation = ["requests", "tqdm", "tree-sitter", "tree-sitter-cpp"]
 
 [tool.setuptools.packages.find]
 include = ["dapper_python", "dapper_python.*"]
