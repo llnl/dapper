@@ -1,6 +1,7 @@
 use crate::dataset::dataset_info::{read_dataset_info, update_dataset_info, Config, Dataset};
 use crate::dataset::dataset_list::{read_dataset_list, RemoteCatalog};
 use crate::directory_info::get_base_directory;
+use reqwest::blocking::Client;
 use std::collections::HashSet;
 use std::error::Error;
 use std::fs;
@@ -113,12 +114,8 @@ pub fn find_datasets(
     Ok(filtered_datasets)
 }
 
-// Download fails if stalls for 30 seconds
-#[cfg(not(test))]
+// download fails if it stalls for this long
 const DOWNLOAD_READ_TIMEOUT: Duration = Duration::from_secs(30);
-// Ensures tests dont have to sit idly for 30 seconds
-#[cfg(test)]
-const DOWNLOAD_READ_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub fn install_dataset(dataset_name: &str, prompt: bool) -> Result<(), Box<dyn Error>> {
     println!("Installing dataset: {dataset_name}");
@@ -158,8 +155,13 @@ pub fn install_dataset(dataset_name: &str, prompt: bool) -> Result<(), Box<dyn E
     let mut temp_file = File::create(&temp_zip_path)
         .map_err(|e| format!("Failed to create temporary file: {e}"))?;
 
+    let client = Client::builder()
+        .timeout(DOWNLOAD_READ_TIMEOUT)
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
+
     // On any download failure, remove the partially written file
-    if let Err(e) = download_to_file(url, &mut temp_file) {
+    if let Err(e) = download_to_file(&client, url, &mut temp_file) {
         drop(temp_file);
         fs::remove_file(&temp_zip_path).ok();
         return Err(e);
@@ -221,13 +223,10 @@ fn extract_db(zip_path: &Path, db_path: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn download_to_file(url: &str, file: &mut File) -> Result<(), Box<dyn Error>> {
+fn download_to_file(client: &Client, url: &str, file: &mut File) -> Result<(), Box<dyn Error>> {
     // Download the dataset - use stalling const
     println!("Downloading from: {url}");
-    let client = reqwest::blocking::Client::builder()
-        .timeout(DOWNLOAD_READ_TIMEOUT)
-        .build()
-        .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
+
     let mut download_response = client
         .get(url)
         .send()
@@ -642,7 +641,7 @@ mod tests {
 
     // Regression test: downloads used to fail if the whole body took longer than the timeout
     #[test]
-    fn test_download_to_file_slow_download() {
+    fn test_download_slow_body() {
         // Takes 2 seconds in total, but never goes quiet for the 1 second test timeout
         let url = serve(|mut stream| {
             stream
@@ -654,30 +653,45 @@ mod tests {
             }
         });
 
+        let client = Client::builder()
+            .timeout(Duration::from_millis(500))
+            .build()
+            .unwrap();
+
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("dataset.zip");
         let mut file = File::create(&path).unwrap();
-        download_to_file(&url, &mut file).unwrap();
+        download_to_file(&client, &url, &mut file).unwrap();
 
         assert_eq!(fs::read(&path).unwrap(), [b'x'; 10]);
     }
 
     #[test]
-    fn test_download_to_file_stalled_download() {
-        // Server sends part of the body, then goes quiet without closing the connection
-        let url = serve(|mut stream| {
+    fn test_download_stalled_body() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        let url = serve(move |mut stream| {
             stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc")
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nh")
                 .unwrap();
-            thread::sleep(Duration::from_secs(5));
+
+            // Keep the connection open without sending the remaining bytes.
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
         });
 
-        let dir = tempfile::tempdir().unwrap();
-        let mut file = File::create(dir.path().join("dataset.zip")).unwrap();
-        let start = std::time::Instant::now();
+        let client = Client::builder()
+            .timeout(Duration::from_millis(500))
+            .build()
+            .unwrap();
 
-        assert!(download_to_file(&url, &mut file).is_err());
-        // Failing before the server hangs up shows the timeout caught the stall
-        assert!(start.elapsed() < Duration::from_secs(3));
+        let mut file = tempfile::tempfile().unwrap();
+        let result = download_to_file(&client, &url, &mut file);
+
+        // Release the server before asserting, including on unexpected results.
+        let _ = release_tx.send(());
+
+        let error = result.unwrap_err();
+        let error = error.downcast_ref::<reqwest::Error>().unwrap();
+        assert!(error.is_timeout());
     }
 }
