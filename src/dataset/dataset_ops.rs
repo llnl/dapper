@@ -7,6 +7,7 @@ use std::fs;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use toml;
 use zip::ZipArchive;
 
@@ -112,6 +113,13 @@ pub fn find_datasets(
     Ok(filtered_datasets)
 }
 
+// Download fails if stalls for 30 seconds
+#[cfg(not(test))]
+const DOWNLOAD_READ_TIMEOUT: Duration = Duration::from_secs(30);
+// Ensures tests dont have to sit idly for 30 seconds
+#[cfg(test)]
+const DOWNLOAD_READ_TIMEOUT: Duration = Duration::from_secs(1);
+
 pub fn install_dataset(dataset_name: &str, prompt: bool) -> Result<(), Box<dyn Error>> {
     println!("Installing dataset: {dataset_name}");
 
@@ -151,8 +159,6 @@ pub fn install_dataset(dataset_name: &str, prompt: bool) -> Result<(), Box<dyn E
         .map_err(|e| format!("Failed to create temporary file: {e}"))?;
 
     // On any download failure, remove the partially written file
-    // TODO: if failure happens after this (at extraction for example), the temp file delete is never reached
-    // Should add the same pull out logic -> delete if unsuccessful
     if let Err(e) = download_to_file(url, &mut temp_file) {
         drop(temp_file);
         fs::remove_file(&temp_zip_path).ok();
@@ -160,9 +166,31 @@ pub fn install_dataset(dataset_name: &str, prompt: bool) -> Result<(), Box<dyn E
     }
     drop(temp_file);
 
+    // ensure that the file is removed regardless of if it was successfully extracted
+    let db_path = base_dir.join(format!("{dataset_name}.db"));
+    let extract_result = extract_db(&temp_zip_path, &db_path);
+    fs::remove_file(&temp_zip_path).ok();
+    extract_result?;
+
+    let new_dataset = Dataset {
+        version,
+        format: format.to_string(),
+        timestamp: dataset.timestamp,
+        categories: categories.clone(),
+        filepath: PathBuf::from(format!("{dataset_name}.db")),
+    };
+
+    // update dataset_info.toml
+    update_dataset_info(Some(base_dir.clone()), dataset_name, new_dataset, true)?;
+
+    println!("Successfully installed dataset: {dataset_name}");
+    Ok(())
+}
+
+fn extract_db(zip_path: &Path, db_path: &Path) -> Result<(), Box<dyn Error>> {
     // Extract the zip file
     println!("Extracting dataset...");
-    let file = File::open(&temp_zip_path).map_err(|e| format!("Failed to open zip file: {e}"))?;
+    let file = File::open(zip_path).map_err(|e| format!("Failed to open zip file: {e}"))?;
 
     let mut archive =
         ZipArchive::new(file).map_err(|e| format!("Failed to read zip archive: {e}"))?;
@@ -184,35 +212,26 @@ pub fn install_dataset(dataset_name: &str, prompt: bool) -> Result<(), Box<dyn E
         .by_name(&db_filename)
         .map_err(|e| format!("Failed to find {db_filename} in archive: {e}"))?;
 
-    let db_path = base_dir.join(format!("{dataset_name}.db"));
     let mut output_file =
-        File::create(&db_path).map_err(|e| format!("Failed to create database file: {e}"))?;
+        File::create(db_path).map_err(|e| format!("Failed to create database file: {e}"))?;
 
     std::io::copy(&mut db_file, &mut output_file)
         .map_err(|e| format!("Failed to extract database file: {e}"))?;
 
-    fs::remove_file(&temp_zip_path).ok();
-
-    let new_dataset = Dataset {
-        version,
-        format: format.to_string(),
-        timestamp: dataset.timestamp,
-        categories: categories.clone(),
-        filepath: PathBuf::from(format!("{dataset_name}.db")),
-    };
-
-    // update dataset_info.toml
-    update_dataset_info(Some(base_dir.clone()), dataset_name, new_dataset, true)?;
-
-    println!("Successfully installed dataset: {dataset_name}");
     Ok(())
 }
 
 fn download_to_file(url: &str, file: &mut File) -> Result<(), Box<dyn Error>> {
-    // Download the dataset
+    // Download the dataset - use stalling const
     println!("Downloading from: {url}");
-    let mut download_response =
-        reqwest::blocking::get(url).map_err(|e| format!("Failed to download dataset: {e}"))?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(DOWNLOAD_READ_TIMEOUT)
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
+    let mut download_response = client
+        .get(url)
+        .send()
+        .map_err(|e| format!("Failed to download dataset: {e}"))?;
 
     if !download_response.status().is_success() {
         return Err(format!(
@@ -604,12 +623,10 @@ impl DatasetDisplay for RemoteCatalog {
 
 #[cfg(test)]
 mod tests {
-    // TODO: test cleanup and stalls
     use super::*;
     use std::io::Read;
     use std::net::{TcpListener, TcpStream};
     use std::thread;
-    use std::time::Duration;
 
     /// Starts a fake server that answers one request with `respond` and returns its URL
     fn serve(respond: impl FnOnce(TcpStream) + Send + 'static) -> String {
@@ -623,37 +640,44 @@ mod tests {
         url
     }
 
-    #[test]
-    fn test_download_to_file() {
-        let url = serve(|mut stream| {
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
-                .unwrap();
-        });
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("dataset.zip");
-        download_to_file(&url, &mut File::create(&path).unwrap()).unwrap();
-
-        assert_eq!(fs::read(&path).unwrap(), b"hello");
-    }
-
+    // Regression test: downloads used to fail if the whole body took longer than the timeout
     #[test]
     fn test_download_to_file_slow_download() {
+        // Takes 2 seconds in total, but never goes quiet for the 1 second test timeout
         let url = serve(|mut stream| {
             stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 35\r\n\r\n")
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n")
                 .unwrap();
-            for _ in 0..35 {
+            for _ in 0..10 {
                 stream.write_all(b"x").unwrap();
-                thread::sleep(Duration::from_secs(1));
+                thread::sleep(Duration::from_millis(200));
             }
         });
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("dataset.zip");
-        download_to_file(&url, &mut File::create(&path).unwrap()).unwrap();
+        let mut file = File::create(&path).unwrap();
+        download_to_file(&url, &mut file).unwrap();
 
-        assert_eq!(fs::read(&path).unwrap(), [b'x'; 35]);
+        assert_eq!(fs::read(&path).unwrap(), [b'x'; 10]);
+    }
+
+    #[test]
+    fn test_download_to_file_stalled_download() {
+        // Server sends part of the body, then goes quiet without closing the connection
+        let url = serve(|mut stream| {
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc")
+                .unwrap();
+            thread::sleep(Duration::from_secs(5));
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut file = File::create(dir.path().join("dataset.zip")).unwrap();
+        let start = std::time::Instant::now();
+
+        assert!(download_to_file(&url, &mut file).is_err());
+        // Failing before the server hangs up shows the timeout caught the stall
+        assert!(start.elapsed() < Duration::from_secs(3));
     }
 }
