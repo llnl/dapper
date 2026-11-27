@@ -1,0 +1,39 @@
+[build-system]
+requires = ["maturin>=1.5,<2"]
+build-backend = "maturin"
+
+[project]
+name = "dapper-bin"
+description = "pip installable dapper binaries"
+readme = "README.md"
+authors = [{ name = "Ryan Mast", email = "mast9@llnl.gov" }]
+license = "MIT"
+license-files = ["LICENSE", "NOTICE"]
+requires-python = ">=3.8"
+keywords = ["source-code-analysis", "c", "c++", "python", "bash", "tree-sitter", "rust"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX :: Linux",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "Topic :: Database",
+  "Topic :: Security",
+  "Topic :: Utilities",
+]
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/LLNL/dapper"
+Issues = "https://github.com/LLNL/dapper/issues"
+
+[tool.maturin]
+# Build the Rust binary as a Python CLI using maturin's `bindings = "bin"`.
+bindings = "bin"
+# Point maturin at the crate manifest in the repo root.
+manifest-path = "Cargo.toml"
+# Name of the exposed module/CLI (sets the wheel name and console script).
+module-name = "dapper"
+
+## No [project.scripts] needed; maturin will generate the console entrypoint in bin mode
