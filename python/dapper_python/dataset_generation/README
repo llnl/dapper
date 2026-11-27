@@ -1,0 +1,2 @@
+The "dataset-generation" sub-package is intended to be an optional addon used primarily when generating datasets
+It can be utilized by installing the "dataset_generation" dependencies via pip install dapper-python[dataset-generation]
